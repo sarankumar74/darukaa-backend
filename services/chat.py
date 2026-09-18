@@ -1,11 +1,10 @@
 import json
+import os
 from typing import List, Dict, Any
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from backend.models.state import EnvironmentalState, ChatResponse, RecommendationResponse
 from backend.services.rag import rag_service
-
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.2)
 
 SYSTEM_PROMPT = """
 You are an expert AI Environmental Scientist specialized in biodiversity and ecology.
@@ -54,25 +53,31 @@ def process_chat(message: str, history: List[Dict], state: EnvironmentalState) -
     
     query = f"{message} " + " ".join([f"{k}:{getattr(state, k)}" for k in active_vars])
     
-    # 2. Retrieve evidence
+    # 2. Retrieve evidence (gracefully handles errors)
     evidence = rag_service.retrieve(query)
     evidence_text = "\n".join([f"Source: {e['source']}\n{e['content']}" for e in evidence])
     
-    # 3. Format prompt
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT)
-    ])
-    
-    chain = prompt | llm
-    
-    response_msg = chain.invoke({
-        "state": state.json(),
-        "message": message,
-        "history": json.dumps(history),
-        "evidence": evidence_text if evidence_text else "No specific evidence found. Ask for more details."
-    })
-    
+    # 3. Try calling the LLM
     try:
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key or len(api_key) < 10:
+            raise ValueError("GEMINI_API_KEY is missing or too short. Please set a valid key in .env")
+        
+        llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.2)
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", SYSTEM_PROMPT)
+        ])
+        
+        chain = prompt | llm
+        
+        response_msg = chain.invoke({
+            "state": state.json(),
+            "message": message,
+            "history": json.dumps(history),
+            "evidence": evidence_text if evidence_text else "No specific evidence found. Use your domain expertise."
+        })
+        
         # Parse JSON from LLM (it might wrap in markdown ```json )
         raw_json = response_msg.content.strip()
         if raw_json.startswith("```json"):
@@ -82,15 +87,32 @@ def process_chat(message: str, history: List[Dict], state: EnvironmentalState) -
             
         data = json.loads(raw_json)
         return ChatResponse(**data)
+        
     except Exception as e:
-        print("Error parsing LLM response:", e)
-        print("Raw response:", response_msg.content)
-        # Fallback
+        error_msg = str(e)
+        print(f"[CHAT] Error: {error_msg}")
+        
+        # Provide helpful fallback depending on number of variables
+        if len(active_vars) < 3:
+            missing = [f for f in ["soil_organic_carbon", "soil_ph", "rainfall", "land_use", "crop_type", "region"] if f not in active_vars]
+            response_text = (
+                f"Thank you for reaching out! To provide you with a scientifically rigorous recommendation, "
+                f"I need at least 3 environmental variables. Currently I have {len(active_vars)} variable(s). "
+                f"Could you please share details about your **{missing[0].replace('_', ' ')}** and **{missing[1].replace('_', ' ')}**? "
+                f"You can also fill in the Environmental Profile panel on the left side."
+            )
+        else:
+            response_text = (
+                f"I have enough data to analyze your ecosystem, but I encountered a temporary issue "
+                f"connecting to the AI engine. Please check that your GEMINI_API_KEY in the .env file "
+                f"is a valid Google AI Studio key (starts with 'AIza...'). Error: {error_msg[:200]}"
+            )
+        
         return ChatResponse(
-            response="I'm having trouble processing that. Could you provide more details about your land use and soil health?",
+            response=response_text,
             updated_state=state,
-            requires_more_info=True,
-            missing_fields=["soil_organic_carbon", "rainfall", "land_use"],
+            requires_more_info=len(active_vars) < 3,
+            missing_fields=[f for f in ["soil_organic_carbon", "rainfall", "land_use"] if f not in active_vars],
             is_final_recommendation=False,
             recommendation_data=None
         )
